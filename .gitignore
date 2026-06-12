@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+*.pyo
+*.pyc
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# PyInstaller
+*.spec.bak
+
+# Sensitive / local config
+.env
+vpn_secret.txt
+vpn_mgmt.pw
+session.json
+*.ovpn
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
