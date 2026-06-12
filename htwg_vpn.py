@@ -260,6 +260,33 @@ def find_openvpn() -> str | None:
     return None
 
 
+class InstallWorker(QThread):
+    line_ready = Signal(str)
+    finished   = Signal(bool)
+
+    def __init__(self, cmd: list[str], extra_env: dict | None = None):
+        super().__init__()
+        self._cmd = cmd
+        self._extra_env = extra_env or {}
+
+    def run(self) -> None:
+        env = dict(os.environ)
+        env.update(self._extra_env)
+        try:
+            proc = subprocess.Popen(
+                self._cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, env=env,
+                creationflags=CREATE_NO_WINDOW if IS_WINDOWS else 0,
+            )
+            for line in proc.stdout:
+                self.line_ready.emit(line.rstrip())
+            proc.wait()
+            self.finished.emit(proc.returncode == 0)
+        except Exception as exc:
+            self.line_ready.emit(f"Fehler: {exc}")
+            self.finished.emit(False)
+
+
 def pick_free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -1227,6 +1254,150 @@ class SetupWizard(QWizard):
 # ===================================================================
 # Dialoge: Verifizieren / Einstellungen / Log
 # ===================================================================
+class InstallDialog(QDialog):
+    """Zeigt Live-Output einer Paketinstallation und wartet auf Abschluss."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"{APP_NAME} — OpenVPN installieren")
+        self.setMinimumSize(580, 420)
+        self._success = False
+
+        self._title = QLabel("OpenVPN wird installiert…")
+        self._title.setStyleSheet(
+            f"font-size: 15px; font-weight: 700; color: {THEME['text']}; background: transparent;"
+        )
+
+        self._status = QLabel("Bitte warten…")
+        self._status.setStyleSheet(f"color: {THEME['text2']}; background: transparent;")
+
+        self._log = QPlainTextEdit()
+        self._log.setReadOnly(True)
+        mono = QFont(_MONO)
+        mono.setPointSize(10)
+        self._log.setFont(mono)
+
+        self._btn = QPushButton("Abbrechen")
+        self._btn.setObjectName("ghostBtn")
+        self._btn.clicked.connect(self.reject)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 20, 20, 20)
+        lay.setSpacing(12)
+        lay.addWidget(self._title)
+        lay.addWidget(self._status)
+        lay.addWidget(self._log)
+        lay.addWidget(self._btn, alignment=Qt.AlignmentFlag.AlignRight)
+
+    def start(self, cmd: list[str], extra_env: dict | None = None) -> None:
+        self._worker = InstallWorker(cmd, extra_env)
+        self._worker.line_ready.connect(self._append)
+        self._worker.finished.connect(self._done)
+        self._worker.start()
+
+    def _append(self, line: str) -> None:
+        self._log.appendPlainText(line)
+        self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
+
+    def _done(self, ok: bool) -> None:
+        self._success = ok
+        if ok:
+            self._status.setText("✓ OpenVPN erfolgreich installiert.")
+            self._btn.setText("Weiter →")
+            self._btn.clicked.disconnect()
+            self._btn.clicked.connect(self.accept)
+        else:
+            self._status.setText("✗ Installation fehlgeschlagen. Bitte manuell installieren.")
+            self._btn.setText("Schließen")
+
+    def succeeded(self) -> bool:
+        return self._success
+
+
+def check_openvpn() -> bool:
+    """Returns False if OpenVPN is missing and the user did not (or could not) install it."""
+    if find_openvpn():
+        return True
+
+    if IS_MACOS:
+        # Locate brew (not always in PATH after a fresh install)
+        brew = shutil.which("brew")
+        for candidate in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew"):
+            if not brew and Path(candidate).exists():
+                brew = candidate
+                break
+
+        if not brew:
+            box = QMessageBox(QMessageBox.Icon.Information, APP_NAME,
+                "OpenVPN ist nicht installiert.\n\n"
+                "Empfohlen: zuerst Homebrew installieren (brew.sh),\n"
+                "dann im Terminal ausführen:\n\n"
+                "    brew install openvpn\n\n"
+                "Danach HTWG VPN neu starten.")
+            box.addButton("Homebrew-Seite öffnen", QMessageBox.ButtonRole.HelpRole)
+            box.addButton("Schließen", QMessageBox.ButtonRole.RejectRole)
+            clicked = box.exec()
+            if box.clickedButton() and box.clickedButton().text() == "Homebrew-Seite öffnen":
+                webbrowser.open("https://brew.sh")
+            return False
+
+        cmd = [brew, "install", "openvpn"]
+        extra_env = {"HOMEBREW_NO_AUTO_UPDATE": "1"}
+
+    elif IS_LINUX:
+        if shutil.which("apt"):
+            pkg_cmd = ["apt", "install", "-y", "openvpn"]
+        elif shutil.which("dnf"):
+            pkg_cmd = ["dnf", "install", "-y", "openvpn"]
+        elif shutil.which("pacman"):
+            pkg_cmd = ["pacman", "-S", "--noconfirm", "openvpn"]
+        else:
+            QMessageBox.information(None, APP_NAME,
+                "OpenVPN ist nicht installiert.\n"
+                "Bitte manuell installieren:\n\n"
+                "    sudo apt install openvpn\n\n"
+                "Dann HTWG VPN neu starten.")
+            return False
+
+        elevate = shutil.which("pkexec") or shutil.which("sudo")
+        cmd = [elevate] + pkg_cmd if elevate else pkg_cmd
+        extra_env = None
+
+    else:  # Windows
+        winget = shutil.which("winget")
+        if winget:
+            cmd = [winget, "install", "--id", "OpenVPNTechnologies.OpenVPN",
+                   "--silent", "--accept-package-agreements", "--accept-source-agreements"]
+            extra_env = None
+        else:
+            QMessageBox.information(None, APP_NAME,
+                "OpenVPN Community ist nicht installiert.\n\n"
+                "Bitte von openvpn.net herunterladen und installieren,\n"
+                "dann HTWG VPN neu starten.")
+            webbrowser.open("https://openvpn.net/community-downloads/")
+            return False
+
+    reply = QMessageBox.question(None, APP_NAME,
+        "OpenVPN Community ist nicht installiert.\n\n"
+        "Soll OpenVPN jetzt automatisch installiert werden?",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+    if reply != QMessageBox.StandardButton.Yes:
+        return False
+
+    dlg = InstallDialog()
+    dlg.start(cmd, extra_env)
+    dlg.exec()
+
+    if dlg.succeeded() and find_openvpn():
+        return True
+
+    if dlg.succeeded():
+        QMessageBox.information(None, APP_NAME,
+            "OpenVPN wurde installiert, aber der Pfad konnte nicht ermittelt werden.\n"
+            "Bitte HTWG VPN neu starten.")
+    return False
+
+
 def _section_label(text: str) -> QLabel:
     lbl = QLabel(text.upper())
     lbl.setStyleSheet(
@@ -1797,6 +1968,9 @@ def main() -> int:
             None, APP_NAME,
             "HTWG VPN läuft bereits.\nBitte die bestehende Instanz verwenden."
         )
+        return 1
+
+    if not check_openvpn():
         return 1
 
     env = EnvStore()
